@@ -20,6 +20,84 @@ let currentViewMode = 'list'; // 'list' | 'view' | 'edit' | 'new'
 let quillEditor = null;
 let currentEditingEntry = null;
 
+// Unsaved-changes tracking for the editor
+let editorDirty = false;
+let appInitialized = false;
+
+// Firestore documents are capped at 1 MiB; leave headroom for metadata
+const MAX_ENTRY_BYTES = 900 * 1024;
+const MAX_VIDEO_BYTES = 600 * 1024;
+
+// ========== Helpers ==========
+
+function pad2(n) {
+    return String(n).padStart(2, '0');
+}
+
+// Local-time YYYY-MM-DD (toISOString() gives the UTC date, which is off by one near midnight)
+function toLocalDateString(d = new Date()) {
+    return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+}
+
+// Parse YYYY-MM-DD as a local date (new Date('YYYY-MM-DD') is parsed as UTC midnight)
+function parseEntryDate(dateStr) {
+    const [y, m, d] = String(dateStr).split('-').map(Number);
+    return new Date(y, (m || 1) - 1, d || 1);
+}
+
+function escapeHtml(str) {
+    return String(str ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+// Only allow http(s) links, blocking javascript:, data: and similar schemes
+function sanitizeUrl(url) {
+    try {
+        const parsed = new URL(url);
+        return parsed.protocol === 'http:' || parsed.protocol === 'https:' ? parsed.href : null;
+    } catch {
+        return null;
+    }
+}
+
+// Media data must be an inline data: URL of the expected kind
+function isSafeMediaData(media) {
+    if (!media || typeof media.data !== 'string') return false;
+    if (media.type === 'image') return media.data.startsWith('data:image/');
+    if (media.type === 'video') return media.data.startsWith('data:video/');
+    return false;
+}
+
+function createSafeLink(url, className) {
+    const safe = sanitizeUrl(url);
+    const el = document.createElement(safe ? 'a' : 'span');
+    el.textContent = url;
+    if (className) el.className = className;
+    if (safe) {
+        el.href = safe;
+        el.target = '_blank';
+        el.rel = 'noopener noreferrer';
+    }
+    return el;
+}
+
+function confirmDiscardChanges() {
+    if ((currentViewMode === 'edit' || currentViewMode === 'new') && editorDirty) {
+        return confirm('You have unsaved changes. Discard them?');
+    }
+    return true;
+}
+
+function showLoginMessage(message, isSuccess = false) {
+    const el = document.getElementById('login-error');
+    el.textContent = message;
+    el.classList.toggle('success', isSuccess);
+}
+
 // Photo library state
 let currentPhotoView = 'entries'; // 'entries' | 'photos'
 let selectedMonth = 'all';
@@ -40,14 +118,14 @@ function setupAuthUI() {
         e.preventDefault();
         document.getElementById('signin-form').style.display = 'none';
         document.getElementById('signup-form').style.display = 'block';
-        document.getElementById('login-error').textContent = '';
+        showLoginMessage('');
     });
 
     document.getElementById('show-signin').addEventListener('click', (e) => {
         e.preventDefault();
         document.getElementById('signup-form').style.display = 'none';
         document.getElementById('signin-form').style.display = 'block';
-        document.getElementById('login-error').textContent = '';
+        showLoginMessage('');
     });
 
     // Forgot password
@@ -97,10 +175,14 @@ async function showApp() {
     // Check for localStorage migration
     await checkForMigration();
 
-    // Load entries from Firestore and setup real-time sync
-    await setupRealtimeSync();
+    // Wire up the UI once; onAuthStateChanged can fire more than once per page load
+    if (!appInitialized) {
+        initApp();
+        appInitialized = true;
+    }
 
-    initApp();
+    // Load entries from Firestore and setup real-time sync
+    setupRealtimeSync();
 }
 
 // Sign In
@@ -108,28 +190,32 @@ async function handleSignIn(e) {
     e.preventDefault();
     const email = document.getElementById('signin-email').value.trim();
     const password = document.getElementById('signin-password').value;
-    const errorEl = document.getElementById('login-error');
 
     try {
         await auth.signInWithEmailAndPassword(email, password);
-        errorEl.textContent = '';
+        showLoginMessage('');
+        document.getElementById('signin-password').value = '';
     } catch (error) {
-        console.error('Sign in error:', error);
+        console.error('Sign in error:', error.code);
         switch (error.code) {
             case 'auth/user-not-found':
-                errorEl.textContent = 'No account found with this email.';
-                break;
             case 'auth/wrong-password':
-                errorEl.textContent = 'Incorrect password.';
+            case 'auth/invalid-credential':
+            case 'auth/invalid-login-credentials':
+                // One message for both cases so the form doesn't reveal which emails have accounts
+                showLoginMessage('Incorrect email or password.');
                 break;
             case 'auth/invalid-email':
-                errorEl.textContent = 'Invalid email address.';
+                showLoginMessage('Invalid email address.');
                 break;
             case 'auth/too-many-requests':
-                errorEl.textContent = 'Too many failed attempts. Try again later.';
+                showLoginMessage('Too many failed attempts. Try again later.');
+                break;
+            case 'auth/network-request-failed':
+                showLoginMessage('Network error. Check your connection and try again.');
                 break;
             default:
-                errorEl.textContent = 'Sign in failed. Please try again.';
+                showLoginMessage('Sign in failed. Please try again.');
         }
     }
 }
@@ -139,30 +225,35 @@ async function handleSignUp(e) {
     e.preventDefault();
     const email = document.getElementById('signup-email').value.trim();
     const password = document.getElementById('signup-password').value;
-    const errorEl = document.getElementById('login-error');
 
-    if (password.length < 6) {
-        errorEl.textContent = 'Password must be at least 6 characters.';
+    if (password.length < 8) {
+        showLoginMessage('Password must be at least 8 characters.');
         return;
     }
 
     try {
         await auth.createUserWithEmailAndPassword(email, password);
-        errorEl.textContent = '';
+        showLoginMessage('');
+        document.getElementById('signup-password').value = '';
     } catch (error) {
-        console.error('Sign up error:', error);
+        console.error('Sign up error:', error.code);
         switch (error.code) {
             case 'auth/email-already-in-use':
-                errorEl.textContent = 'An account with this email already exists.';
+                showLoginMessage('Could not create an account with this email. Try signing in instead.');
                 break;
             case 'auth/invalid-email':
-                errorEl.textContent = 'Invalid email address.';
+                showLoginMessage('Invalid email address.');
                 break;
             case 'auth/weak-password':
-                errorEl.textContent = 'Password is too weak.';
+            case 'auth/password-does-not-meet-requirements':
+                showLoginMessage('Password is too weak. Use a longer password with a mix of characters.');
+                break;
+            case 'auth/operation-not-allowed':
+            case 'auth/admin-restricted-operation':
+                showLoginMessage('New account registration is disabled.');
                 break;
             default:
-                errorEl.textContent = 'Sign up failed. Please try again.';
+                showLoginMessage('Sign up failed. Please try again.');
         }
     }
 }
@@ -172,32 +263,57 @@ async function handleForgotPassword(e) {
     e.preventDefault();
     const email = document.getElementById('signin-email').value.trim();
 
+    const resetSentMessage = 'If an account exists for this email, a reset link has been sent.';
+
     if (!email) {
-        alert('Please enter your email address first.');
+        showLoginMessage('Enter your email address above, then click "Forgot password?" again.');
         return;
     }
 
     try {
         await auth.sendPasswordResetEmail(email);
-        alert('Password reset email sent! Check your inbox.');
+        showLoginMessage(resetSentMessage, true);
     } catch (error) {
-        console.error('Password reset error:', error);
+        console.error('Password reset error:', error.code);
         if (error.code === 'auth/user-not-found') {
-            alert('No account found with this email.');
+            // Don't reveal whether the account exists
+            showLoginMessage(resetSentMessage, true);
+        } else if (error.code === 'auth/invalid-email') {
+            showLoginMessage('Invalid email address.');
         } else {
-            alert('Failed to send password reset email. Please try again.');
+            showLoginMessage('Failed to send password reset email. Please try again.');
         }
     }
 }
 
 // Logout
 async function logout() {
+    if (!confirmDiscardChanges()) return;
+
+    if (unsubscribeSnapshot) {
+        unsubscribeSnapshot();
+        unsubscribeSnapshot = null;
+    }
+
     try {
         await auth.signOut();
     } catch (error) {
         console.error('Logout error:', error);
         alert('Failed to log out. Please try again.');
+        return;
     }
+
+    // Remove the offline copy of the journal from this device (IndexedDB cache)
+    try {
+        await db.terminate();
+        await db.clearPersistence();
+    } catch (error) {
+        // Fails if the app is open in another tab; it is cleared on a later logout
+        console.warn('Could not clear offline cache:', error.code || error);
+    }
+
+    // Reload so no entries stay in memory or in the hidden DOM
+    window.location.reload();
 }
 
 // Calendar Functions
@@ -255,7 +371,7 @@ function renderCalendar() {
     for (let day = 1; day <= daysInMonth; day++) {
         const dateStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
         const hasEntry = entryDates.has(dateStr);
-        const isToday = dateStr === new Date().toISOString().split('T')[0];
+        const isToday = dateStr === toLocalDateString();
         const isSelected = dateStr === selectedDate;
 
         const dayEl = createCalendarDay(day, false, dateStr, hasEntry, isToday, isSelected);
@@ -310,65 +426,9 @@ function handleDateClick(dateStr) {
     // Re-render calendar to show selected state
     renderCalendar();
 
-    // Filter entry list by date
-    filterEntryListByDate(dateStr);
-}
-
-// Filter entry list by specific date
-function filterEntryListByDate(dateStr) {
-    const container = document.getElementById('entry-list-container');
-    if (!container) return;
-
-    container.innerHTML = '';
-
-    const filteredEntries = entries.filter(entry => entry.date === dateStr);
-
-    if (filteredEntries.length === 0) {
-        container.innerHTML = '<div class="no-entries">No entries for this date</div>';
-        return;
-    }
-
-    // Sort by date (newest first)
-    const sortedEntries = [...filteredEntries].sort((a, b) => b.date.localeCompare(a.date));
-
-    sortedEntries.forEach(entry => {
-        const item = createEntryListItem(entry);
-        container.appendChild(item);
-    });
-}
-
-// Keep old filterByDate for backward compatibility
-function filterByDate(dateStr) {
-    const container = document.getElementById('entries-container');
-    if (!container) return;
-
-    container.innerHTML = '';
-
-    const filteredEntries = entries.filter(entry => entry.date === dateStr);
-
-    if (filteredEntries.length === 0) {
-        const date = new Date(dateStr);
-        const formattedDate = date.toLocaleDateString('en-US', {
-            weekday: 'long',
-            month: 'long',
-            day: 'numeric',
-            year: 'numeric'
-        });
-        container.innerHTML = `<div class="no-entries">No entries for ${formattedDate}</div>`;
-        return;
-    }
-
-    // Sort by timestamp if multiple entries on same day
-    filteredEntries.sort((a, b) => {
-        const timeA = a.createdAt?.toMillis?.() || 0;
-        const timeB = b.createdAt?.toMillis?.() || 0;
-        return timeB - timeA;
-    });
-
-    filteredEntries.forEach(entry => {
-        const card = createEntryCard(entry);
-        container.appendChild(card);
-    });
+    // Show the entries tab filtered by this date
+    if (currentPhotoView !== 'entries') switchTab('entries');
+    displayEntryList();
 }
 
 // ========== Photo Library Functions ==========
@@ -400,21 +460,7 @@ function switchTab(tabName) {
 function getAllPhotos() {
     const allPhotos = [];
 
-    entries.forEach(entry => {
-        if (entry.media && entry.media.length > 0) {
-            entry.media.forEach((media, index) => {
-                if (media.type === 'image' || media.type === 'video') {
-                    allPhotos.push({
-                        ...media,
-                        entryId: entry.id,
-                        entryDate: entry.date,
-                        entryText: entry.text || '',
-                        mediaIndex: index
-                    });
-                }
-            });
-        }
-    });
+    entries.forEach(entry => allPhotos.push(...getEntryPhotos(entry)));
 
     // Sort by date (newest first)
     allPhotos.sort((a, b) => b.entryDate.localeCompare(a.entryDate));
@@ -422,10 +468,23 @@ function getAllPhotos() {
     return allPhotos;
 }
 
+// Images and videos of a single entry, with entry metadata for the lightbox
+function getEntryPhotos(entry) {
+    return (entry.media || [])
+        .map((media, index) => ({
+            ...media,
+            entryId: entry.id,
+            entryDate: entry.date,
+            entryText: entry.text || '',
+            mediaIndex: index
+        }))
+        .filter(isSafeMediaData);
+}
+
 // Filter photos by month/year
 function filterPhotos(photos) {
     return photos.filter(photo => {
-        const photoDate = new Date(photo.entryDate);
+        const photoDate = parseEntryDate(photo.entryDate);
 
         // Check month filter
         if (selectedMonth !== 'all') {
@@ -485,23 +544,26 @@ function createPhotoGridItem(photo, index) {
     }
 
     // Format date
-    const date = new Date(photo.entryDate);
+    const date = parseEntryDate(photo.entryDate);
     const formattedDate = date.toLocaleDateString('en-US', {
         month: 'short',
         day: 'numeric'
     });
 
+    const mediaEl = document.createElement(photo.type === 'video' ? 'video' : 'img');
+    mediaEl.src = photo.data;
     if (photo.type === 'image') {
-        item.innerHTML = `
-            <img src="${photo.data}" alt="Photo from ${formattedDate}">
-            <div class="photo-date-badge">${formattedDate}</div>
-        `;
-    } else if (photo.type === 'video') {
-        item.innerHTML = `
-            <video src="${photo.data}"></video>
-            <div class="photo-date-badge">${formattedDate}</div>
-        `;
+        mediaEl.alt = `Photo from ${formattedDate}`;
+        mediaEl.loading = 'lazy';
+    } else {
+        mediaEl.preload = 'metadata';
     }
+
+    const badge = document.createElement('div');
+    badge.className = 'photo-date-badge';
+    badge.textContent = formattedDate;
+
+    item.append(mediaEl, badge);
 
     item.addEventListener('click', () => openLightbox(index));
 
@@ -512,7 +574,7 @@ function createPhotoGridItem(photo, index) {
 function populateYearFilter(photos) {
     const years = new Set();
     photos.forEach(photo => {
-        const year = new Date(photo.entryDate).getFullYear();
+        const year = parseEntryDate(photo.entryDate).getFullYear();
         years.add(year);
     });
 
@@ -531,7 +593,8 @@ function populateYearFilter(photos) {
 }
 
 // Open lightbox at specific photo
-function openLightbox(index) {
+function openLightbox(index, photos = lightboxPhotos) {
+    lightboxPhotos = photos;
     currentLightboxIndex = index;
     const photo = lightboxPhotos[index];
 
@@ -560,7 +623,7 @@ function displayLightboxPhoto(photo) {
     }
 
     // Set entry info
-    const date = new Date(photo.entryDate);
+    const date = parseEntryDate(photo.entryDate);
     const formattedDate = date.toLocaleDateString('en-US', {
         weekday: 'long',
         month: 'long',
@@ -649,6 +712,10 @@ function initQuillEditor() {
         },
         placeholder: 'Write your thoughts here...'
     });
+
+    quillEditor.on('text-change', (delta, oldDelta, source) => {
+        if (source === 'user') editorDirty = true;
+    });
 }
 
 // Display entries as compact list items in sidebar
@@ -658,13 +725,18 @@ function displayEntryList() {
 
     container.innerHTML = '';
 
-    if (entries.length === 0) {
-        container.innerHTML = '<div class="no-entries">No entries yet. Create your first entry!</div>';
+    // Respect the calendar date filter, if any
+    const visibleEntries = selectedDate ? entries.filter(entry => entry.date === selectedDate) : entries;
+
+    if (visibleEntries.length === 0) {
+        container.innerHTML = selectedDate
+            ? '<div class="no-entries">No entries for this date</div>'
+            : '<div class="no-entries">No entries yet. Create your first entry!</div>';
         return;
     }
 
     // Sort by date (newest first)
-    const sortedEntries = [...entries].sort((a, b) => b.date.localeCompare(a.date));
+    const sortedEntries = [...visibleEntries].sort((a, b) => b.date.localeCompare(a.date));
 
     sortedEntries.forEach(entry => {
         const item = createEntryListItem(entry);
@@ -681,7 +753,7 @@ function createEntryListItem(entry) {
     }
 
     // Format date
-    const date = new Date(entry.date);
+    const date = parseEntryDate(entry.date);
     const formattedDate = date.toLocaleDateString('en-US', {
         month: 'short',
         day: 'numeric',
@@ -692,24 +764,19 @@ function createEntryListItem(entry) {
     const textPreview = entry.text ? entry.text.substring(0, 100) : 'No text';
 
     // Get first image thumbnail
-    let thumbnail = null;
-    if (entry.media && entry.media.length > 0) {
-        const firstImage = entry.media.find(m => m.type === 'image');
-        if (firstImage) {
-            thumbnail = firstImage.data;
-        }
-    }
+    const firstImage = (entry.media || []).find(m => m.type === 'image' && isSafeMediaData(m));
+    const thumbnail = firstImage ? firstImage.data : null;
 
     // Count media
     const mediaCount = entry.media ? entry.media.length : 0;
 
-    // Build HTML
+    // Build HTML (all user content is escaped)
     item.innerHTML = `
-        <div class="entry-list-date">${formattedDate}</div>
+        <div class="entry-list-date">${escapeHtml(formattedDate)}</div>
         <div class="entry-list-preview">
-            ${thumbnail ? `<img src="${thumbnail}" class="entry-list-thumbnail" alt="Entry thumbnail">` : ''}
+            ${thumbnail ? `<img src="${escapeHtml(thumbnail)}" class="entry-list-thumbnail" alt="Entry thumbnail" loading="lazy">` : ''}
             <div class="entry-list-text">
-                <p>${textPreview}</p>
+                <p>${escapeHtml(textPreview)}</p>
                 ${mediaCount > 0 ? `<div class="entry-list-meta"><span>📎 ${mediaCount} media</span></div>` : ''}
             </div>
         </div>
@@ -723,7 +790,10 @@ function createEntryListItem(entry) {
 }
 
 // Select an entry and show detail view
-function selectEntry(entryId) {
+function selectEntry(entryId, { skipConfirm = false } = {}) {
+    if (!skipConfirm && !confirmDiscardChanges()) return;
+    editorDirty = false;
+
     selectedEntryId = entryId;
     currentViewMode = 'view';
 
@@ -745,7 +815,7 @@ function displayEntryDetail(entry) {
     document.getElementById('entry-detail').style.display = 'block';
 
     // Format date
-    const date = new Date(entry.date);
+    const date = parseEntryDate(entry.date);
     const formattedDate = date.toLocaleDateString('en-US', {
         weekday: 'long',
         month: 'long',
@@ -755,6 +825,8 @@ function displayEntryDetail(entry) {
 
     // Set date
     document.querySelector('.detail-date').textContent = formattedDate;
+
+    const entryPhotos = getEntryPhotos(entry);
 
     // Set text content (check for rich content first)
     const detailText = document.getElementById('detail-text');
@@ -773,12 +845,20 @@ function displayEntryDetail(entry) {
     detailMedia.innerHTML = '';
 
     if (entry.media && entry.media.length > 0) {
-        entry.media.forEach(item => {
+        entry.media.forEach((item, mediaIndex) => {
+            if (item.type === 'url') {
+                detailMedia.appendChild(createSafeLink(item.data, 'entry-url'));
+                return;
+            }
+            if (!isSafeMediaData(item)) return;
+
             if (item.type === 'image') {
                 const img = document.createElement('img');
                 img.src = item.data;
                 img.alt = 'Entry image';
-                img.addEventListener('click', () => window.open(item.data, '_blank'));
+                // Browsers block opening data: URLs in a new tab, so show it in the lightbox
+                const photoIndex = entryPhotos.findIndex(p => p.mediaIndex === mediaIndex);
+                img.addEventListener('click', () => openLightbox(photoIndex, entryPhotos));
                 detailMedia.appendChild(img);
             } else if (item.type === 'video') {
                 const video = document.createElement('video');
@@ -787,13 +867,6 @@ function displayEntryDetail(entry) {
                 video.style.width = '100%';
                 video.style.borderRadius = '12px';
                 detailMedia.appendChild(video);
-            } else if (item.type === 'url') {
-                const link = document.createElement('a');
-                link.href = item.data;
-                link.target = '_blank';
-                link.textContent = item.data;
-                link.className = 'entry-url';
-                detailMedia.appendChild(link);
             }
         });
     }
@@ -801,11 +874,13 @@ function displayEntryDetail(entry) {
     // Setup action buttons
     document.getElementById('edit-entry-btn').onclick = () => editEntry(entry);
     document.getElementById('delete-entry-btn').onclick = () => deleteEntry(entry.id);
-    document.getElementById('download-entry-btn').onclick = () => downloadEntryPDF(entry);
+    document.getElementById('download-entry-btn').onclick = () => downloadEntryAsPDF(entry);
 }
 
 // Show editor for new entry
 function showNewEntryEditor() {
+    if (!confirmDiscardChanges()) return;
+
     selectedEntryId = null;
     currentViewMode = 'new';
     currentEditingEntry = null;
@@ -818,13 +893,13 @@ function showNewEntryEditor() {
     document.getElementById('entry-detail').style.display = 'none';
     document.getElementById('entry-editor').style.display = 'block';
 
-    // Set default date to today
-    const today = new Date().toISOString().split('T')[0];
-    document.getElementById('editor-date').value = today;
+    // Set default date to today (or the date selected in the calendar)
+    document.getElementById('editor-date').value = selectedDate || toLocalDateString();
 
     // Clear editor
     quillEditor.setContents([]);
     currentMedia = [];
+    editorDirty = false;
     const previewEl = document.getElementById('editor-media-preview');
     if (previewEl) previewEl.innerHTML = '';
 
@@ -857,12 +932,16 @@ function editEntry(entry) {
     // Load media
     currentMedia = entry.media ? [...entry.media] : [];
     displayMediaPreview();
+    editorDirty = false;
 
     // Setup buttons
-    document.getElementById('cancel-edit-btn').onclick = () => {
-        selectEntry(entry.id); // Go back to view mode
-    };
+    document.getElementById('cancel-edit-btn').onclick = cancelEdit;
     document.getElementById('save-edit-btn').onclick = saveCurrentEntry;
+}
+
+// Approximate serialized size of an entry, to stay under Firestore's 1 MiB document limit
+function estimateEntryBytes(entryData) {
+    return new Blob([JSON.stringify(entryData)]).size;
 }
 
 // Save current entry (new or edit)
@@ -891,39 +970,55 @@ async function saveCurrentEntry() {
         date: date,
         text: text, // Plain text for backward compatibility
         content: { ops: content.ops }, // Rich text Delta format (plain object)
-        media: currentMedia,
-        updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+        media: currentMedia
     };
 
+    const sizeBytes = estimateEntryBytes(entryData);
+    if (sizeBytes > MAX_ENTRY_BYTES) {
+        alert(`This entry is too large to save (${Math.round(sizeBytes / 1024)} KB, limit ${Math.round(MAX_ENTRY_BYTES / 1024)} KB).\n\nRemove some images or videos, or add videos as a URL link instead.`);
+        return;
+    }
+
+    entryData.updatedAt = firebase.firestore.FieldValue.serverTimestamp();
+
+    const saveBtn = document.getElementById('save-edit-btn');
+    saveBtn.disabled = true;
+
     try {
+        const collection = db.collection(`users/${currentUser.uid}/entries`);
+        let docRef;
+        let writePromise;
+
         if (currentViewMode === 'new') {
-            // Create new entry
             entryData.createdAt = firebase.firestore.FieldValue.serverTimestamp();
-            const docRef = await db.collection(`users/${currentUser.uid}/entries`).add(entryData);
-
-            // Switch to view mode for new entry
-            setTimeout(() => {
-                selectEntry(docRef.id);
-            }, 500);
+            docRef = collection.doc();
+            writePromise = docRef.set(entryData);
         } else if (currentViewMode === 'edit') {
-            // Update existing entry
-            await db.collection(`users/${currentUser.uid}/entries`)
-                .doc(currentEditingEntry.id)
-                .update(entryData);
-
-            // Switch to view mode
-            setTimeout(() => {
-                selectEntry(currentEditingEntry.id);
-            }, 500);
+            docRef = collection.doc(currentEditingEntry.id);
+            writePromise = docRef.update(entryData);
+        } else {
+            return;
         }
+
+        // Firestore applies the write locally right away; switch to view mode without
+        // waiting for the server so saving also works while offline
+        editorDirty = false;
+        selectEntry(docRef.id, { skipConfirm: true });
+
+        await writePromise;
     } catch (error) {
         console.error('Error saving entry:', error);
         alert('Failed to save entry: ' + error.message);
+    } finally {
+        saveBtn.disabled = false;
     }
 }
 
 // Cancel edit
 function cancelEdit() {
+    if (!confirmDiscardChanges()) return;
+    editorDirty = false;
+
     if (currentViewMode === 'edit' && currentEditingEntry) {
         selectEntry(currentEditingEntry.id);
     } else {
@@ -1007,6 +1102,17 @@ function initApp() {
     const lightboxNext = document.querySelector('.lightbox-next');
     if (lightboxNext) lightboxNext.addEventListener('click', () => navigateLightbox(1));
 
+    const editorDate = document.getElementById('editor-date');
+    if (editorDate) editorDate.addEventListener('change', () => { editorDirty = true; });
+
+    // Warn before closing the tab with unsaved writing
+    window.addEventListener('beforeunload', (e) => {
+        if ((currentViewMode === 'edit' || currentViewMode === 'new') && editorDirty) {
+            e.preventDefault();
+            e.returnValue = '';
+        }
+    });
+
     // Display entries
     displayEntryList();
     showEmptyState();
@@ -1051,6 +1157,9 @@ function compressImage(file, maxWidth = 1200, maxHeight = 1200, quality = 0.8) {
                 canvas.height = height;
 
                 const ctx = canvas.getContext('2d');
+                // White background so transparent PNGs don't turn black as JPEG
+                ctx.fillStyle = '#ffffff';
+                ctx.fillRect(0, 0, width, height);
                 ctx.drawImage(img, 0, 0, width, height);
 
                 // Convert to compressed JPEG
@@ -1071,15 +1180,18 @@ async function handleImageUpload(e) {
     if (!files || files.length === 0) return;
 
     for (let file of files) {
+        if (!file.type.startsWith('image/')) {
+            alert(`"${file.name}" is not an image.`);
+            continue;
+        }
         try {
-            console.log('Processing image:', file.name, 'Size:', Math.round(file.size / 1024) + 'KB');
             const compressedImage = await compressImage(file);
             currentMedia.push({
                 type: 'image',
                 data: compressedImage
             });
+            editorDirty = true;
             displayMediaPreview();
-            console.log('Image processed successfully');
         } catch (error) {
             console.error('Error processing image:', error);
             if (error !== 'User cancelled large file upload') {
@@ -1097,12 +1209,15 @@ function handleVideoUpload(e) {
     const files = e.target.files;
 
     for (let file of files) {
-        // Warn about large video files (over 10MB)
-        if (file.size > 10 * 1024 * 1024) {
-            alert('Warning: This video is very large (' + Math.round(file.size / 1024 / 1024) + 'MB). Large videos may cause performance issues or exceed storage limits. Consider using a URL link to the video instead.');
-            if (!confirm('Continue with this video?')) {
-                continue;
-            }
+        if (!file.type.startsWith('video/')) {
+            alert(`"${file.name}" is not a video.`);
+            continue;
+        }
+
+        // Videos are stored inline in the entry document, which Firestore caps at 1 MiB
+        if (file.size > MAX_VIDEO_BYTES) {
+            alert(`"${file.name}" is too large (${(file.size / 1024 / 1024).toFixed(1)} MB). Videos must be under ${Math.round(MAX_VIDEO_BYTES / 1024)} KB.\n\nUpload it to a video service and add it as a URL instead.`);
+            continue;
         }
 
         const reader = new FileReader();
@@ -1112,6 +1227,7 @@ function handleVideoUpload(e) {
                     type: 'video',
                     data: event.target.result
                 });
+                editorDirty = true;
                 displayMediaPreview();
             } catch (error) {
                 console.error('Error processing video:', error);
@@ -1133,16 +1249,27 @@ function handleAddURL() {
     const urlInput = document.getElementById('editor-url-input');
     if (!urlInput) return;
 
-    const url = urlInput.value.trim();
+    let url = urlInput.value.trim();
+    if (!url) return;
 
-    if (url) {
-        currentMedia.push({
-            type: 'url',
-            data: url
-        });
-        urlInput.value = '';
-        displayMediaPreview();
+    // Accept "example.com" by assuming https
+    if (!/^[a-z][a-z0-9+.-]*:/i.test(url)) {
+        url = 'https://' + url;
     }
+
+    const safeUrl = sanitizeUrl(url);
+    if (!safeUrl) {
+        alert('Please enter a valid http:// or https:// link.');
+        return;
+    }
+
+    currentMedia.push({
+        type: 'url',
+        data: safeUrl
+    });
+    editorDirty = true;
+    urlInput.value = '';
+    displayMediaPreview();
 }
 
 // Display media preview
@@ -1156,27 +1283,23 @@ function displayMediaPreview() {
         const mediaItem = document.createElement('div');
         mediaItem.className = 'media-item';
 
-        if (media.type === 'image') {
+        if (media.type === 'url') {
+            mediaItem.appendChild(createSafeLink(media.data, 'url-link'));
+        } else if (isSafeMediaData(media) && media.type === 'image') {
             const img = document.createElement('img');
             img.src = media.data;
             mediaItem.appendChild(img);
-        } else if (media.type === 'video') {
+        } else if (isSafeMediaData(media) && media.type === 'video') {
             const video = document.createElement('video');
             video.src = media.data;
             video.controls = true;
             mediaItem.appendChild(video);
-        } else if (media.type === 'url') {
-            const link = document.createElement('a');
-            link.href = media.data;
-            link.className = 'url-link';
-            link.textContent = media.data;
-            link.target = '_blank';
-            mediaItem.appendChild(link);
         }
 
         const removeBtn = document.createElement('button');
         removeBtn.className = 'remove-media';
         removeBtn.textContent = '×';
+        removeBtn.setAttribute('aria-label', 'Remove media');
         removeBtn.onclick = () => removeMedia(index);
         mediaItem.appendChild(removeBtn);
 
@@ -1184,66 +1307,11 @@ function displayMediaPreview() {
     });
 }
 
-// Legacy name for backward compatibility
-function displayMediaPreview() {
-    displayMediaPreview();
-}
-
 // Remove media item
 function removeMedia(index) {
     currentMedia.splice(index, 1);
+    editorDirty = true;
     displayMediaPreview();
-}
-
-// Save entry to Firestore
-async function saveEntry() {
-    const date = document.getElementById('entry-date').value;
-    const text = document.getElementById('entry-text').value.trim();
-
-    if (!date) {
-        alert('Please select a date for your entry.');
-        return;
-    }
-
-    if (!text && currentMedia.length === 0) {
-        alert('Please write something or add media to your entry.');
-        return;
-    }
-
-    if (!currentUser) {
-        alert('You must be signed in to save entries.');
-        return;
-    }
-
-    const entry = {
-        date: date,
-        text: text,
-        media: [...currentMedia],
-        createdAt: firebase.firestore.FieldValue.serverTimestamp(),
-        updatedAt: firebase.firestore.FieldValue.serverTimestamp()
-    };
-
-    try {
-        // Add to Firestore
-        await db.collection(`users/${currentUser.uid}/entries`).add(entry);
-
-        // Clear form only if save was successful
-        document.getElementById('entry-text').value = '';
-        document.getElementById('image-upload').value = '';
-        document.getElementById('video-upload').value = '';
-        document.getElementById('url-input').value = '';
-        currentMedia = [];
-        displayMediaPreview();
-
-        // Reset date to today
-        const today = new Date().toISOString().split('T')[0];
-        document.getElementById('entry-date').value = today;
-
-        alert('Entry saved successfully!');
-    } catch (error) {
-        console.error('Failed to save entry:', error);
-        alert('Failed to save entry. Please try again.');
-    }
 }
 
 // Setup real-time sync with Firestore
@@ -1284,50 +1352,63 @@ function setupRealtimeSync() {
         });
 }
 
+// Read legacy entries from localStorage, ignoring corrupt or malformed data
+function readLocalEntries() {
+    try {
+        const parsed = JSON.parse(localStorage.getItem('journalEntries') || '[]');
+        if (!Array.isArray(parsed)) return [];
+        return parsed.filter(entry => entry && /^\d{4}-\d{2}-\d{2}$/.test(entry.date));
+    } catch (error) {
+        console.warn('Ignoring unreadable local entries:', error);
+        return [];
+    }
+}
+
 // Check for localStorage data and offer migration
 async function checkForMigration() {
-    const localEntries = localStorage.getItem('journalEntries');
+    const entriesArray = readLocalEntries();
 
-    if (localEntries) {
-        const entriesArray = JSON.parse(localEntries);
-
-        if (entriesArray.length > 0) {
-            // Show migration modal
-            const message = `We found ${entriesArray.length} ${entriesArray.length === 1 ? 'entry' : 'entries'} on this device. Would you like to import ${entriesArray.length === 1 ? 'it' : 'them'} to your cloud account?`;
-            document.getElementById('migration-message').textContent = message;
-            document.getElementById('migration-modal').style.display = 'flex';
-        }
+    if (entriesArray.length > 0) {
+        // Show migration modal
+        const message = `We found ${entriesArray.length} ${entriesArray.length === 1 ? 'entry' : 'entries'} on this device. Would you like to import ${entriesArray.length === 1 ? 'it' : 'them'} to your cloud account?`;
+        document.getElementById('migration-message').textContent = message;
+        document.getElementById('migration-modal').style.display = 'flex';
     }
 }
 
 // Migrate localStorage entries to Firestore
 async function migrateLocalStorageToFirebase() {
-    const localEntries = localStorage.getItem('journalEntries');
+    const entriesArray = readLocalEntries();
 
-    if (!localEntries || !currentUser) {
+    if (entriesArray.length === 0 || !currentUser) {
         document.getElementById('migration-modal').style.display = 'none';
         return;
     }
 
     try {
-        const entriesArray = JSON.parse(localEntries);
         document.getElementById('migration-message').textContent = `Importing ${entriesArray.length} entries...`;
 
-        // Use batched writes for better performance
-        const batch = db.batch();
+        // Firestore batches are limited to 500 writes
+        const BATCH_SIZE = 400;
+        for (let i = 0; i < entriesArray.length; i += BATCH_SIZE) {
+            const batch = db.batch();
 
-        entriesArray.forEach(entry => {
-            const docRef = db.collection(`users/${currentUser.uid}/entries`).doc();
-            batch.set(docRef, {
-                date: entry.date,
-                text: entry.text || '',
-                media: entry.media || [],
-                createdAt: entry.timestamp ? firebase.firestore.Timestamp.fromDate(new Date(entry.timestamp)) : firebase.firestore.FieldValue.serverTimestamp(),
-                updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+            entriesArray.slice(i, i + BATCH_SIZE).forEach(entry => {
+                const docRef = db.collection(`users/${currentUser.uid}/entries`).doc();
+                const timestamp = entry.timestamp ? new Date(entry.timestamp) : null;
+                batch.set(docRef, {
+                    date: entry.date,
+                    text: typeof entry.text === 'string' ? entry.text : '',
+                    media: Array.isArray(entry.media) ? entry.media : [],
+                    createdAt: timestamp && !isNaN(timestamp)
+                        ? firebase.firestore.Timestamp.fromDate(timestamp)
+                        : firebase.firestore.FieldValue.serverTimestamp(),
+                    updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+                });
             });
-        });
 
-        await batch.commit();
+            await batch.commit();
+        }
 
         // Clear localStorage after successful migration
         localStorage.removeItem('journalEntries');
@@ -1339,95 +1420,6 @@ async function migrateLocalStorageToFirebase() {
         console.error('Migration error:', error);
         alert('Failed to import entries. Please try again.');
     }
-}
-
-// Display entries
-function displayEntries() {
-    const container = document.getElementById('entries-container');
-    container.innerHTML = '';
-
-    if (entries.length === 0) {
-        container.innerHTML = '<div class="no-entries">No entries yet. Start writing your first entry!</div>';
-        return;
-    }
-
-    // Sort entries by date (newest first)
-    const sortedEntries = [...entries].sort((a, b) => new Date(b.date) - new Date(a.date));
-
-    sortedEntries.forEach(entry => {
-        const card = createEntryCard(entry);
-        container.appendChild(card);
-    });
-}
-
-// Create entry card
-function createEntryCard(entry) {
-    const card = document.createElement('div');
-    card.className = 'entry-card';
-
-    const dateEl = document.createElement('div');
-    dateEl.className = 'entry-date';
-    const entryDate = new Date(entry.date);
-    dateEl.textContent = entryDate.toLocaleDateString('en-US', {
-        weekday: 'long',
-        year: 'numeric',
-        month: 'long',
-        day: 'numeric'
-    });
-    card.appendChild(dateEl);
-
-    if (entry.text) {
-        const contentEl = document.createElement('div');
-        contentEl.className = 'entry-content';
-        contentEl.textContent = entry.text;
-        card.appendChild(contentEl);
-    }
-
-    if (entry.media && entry.media.length > 0) {
-        const mediaContainer = document.createElement('div');
-        mediaContainer.className = 'entry-media';
-
-        entry.media.forEach(media => {
-            if (media.type === 'image') {
-                const img = document.createElement('img');
-                img.src = media.data;
-                img.onclick = () => window.open(media.data, '_blank');
-                mediaContainer.appendChild(img);
-            } else if (media.type === 'video') {
-                const video = document.createElement('video');
-                video.src = media.data;
-                video.controls = true;
-                mediaContainer.appendChild(video);
-            } else if (media.type === 'url') {
-                const link = document.createElement('a');
-                link.href = media.data;
-                link.textContent = media.data;
-                link.target = '_blank';
-                mediaContainer.appendChild(link);
-            }
-        });
-
-        card.appendChild(mediaContainer);
-    }
-
-    const actionsEl = document.createElement('div');
-    actionsEl.className = 'entry-actions';
-
-    const downloadBtn = document.createElement('button');
-    downloadBtn.className = 'download-btn';
-    downloadBtn.textContent = 'Download PDF';
-    downloadBtn.onclick = () => downloadEntryAsPDF(entry);
-    actionsEl.appendChild(downloadBtn);
-
-    const deleteBtn = document.createElement('button');
-    deleteBtn.className = 'delete-btn';
-    deleteBtn.textContent = 'Delete Entry';
-    deleteBtn.onclick = () => deleteEntry(entry.id);
-    actionsEl.appendChild(deleteBtn);
-
-    card.appendChild(actionsEl);
-
-    return card;
 }
 
 // Delete entry from Firestore
@@ -1442,44 +1434,21 @@ async function deleteEntry(id) {
     }
 
     try {
-        await db.collection(`users/${currentUser.uid}/entries`).doc(id).delete();
-        // displayEntries() will be called automatically by real-time listener
+        const deletePromise = db.collection(`users/${currentUser.uid}/entries`).doc(id).delete();
+
+        // Don't keep showing an entry that no longer exists
+        if (selectedEntryId === id) {
+            selectedEntryId = null;
+            currentViewMode = 'list';
+            showEmptyState();
+        }
+
+        // The list refreshes via the real-time listener
+        await deletePromise;
     } catch (error) {
         console.error('Failed to delete entry:', error);
         alert('Failed to delete entry. Please try again.');
     }
-}
-
-// Filter entries by month
-function filterEntries() {
-    const filterValue = document.getElementById('filter-month').value;
-
-    if (!filterValue) {
-        alert('Please select a month to filter.');
-        return;
-    }
-
-    const [year, month] = filterValue.split('-');
-    const container = document.getElementById('entries-container');
-    container.innerHTML = '';
-
-    const filteredEntries = entries.filter(entry => {
-        const entryDate = new Date(entry.date);
-        return entryDate.getFullYear() == year && (entryDate.getMonth() + 1) == month;
-    });
-
-    if (filteredEntries.length === 0) {
-        container.innerHTML = '<div class="no-entries">No entries found for this month.</div>';
-        return;
-    }
-
-    // Sort filtered entries by date (newest first)
-    const sortedEntries = [...filteredEntries].sort((a, b) => new Date(b.date) - new Date(a.date));
-
-    sortedEntries.forEach(entry => {
-        const card = createEntryCard(entry);
-        container.appendChild(card);
-    });
 }
 
 // PDF Download Functions
@@ -1501,7 +1470,7 @@ async function downloadEntryAsPDF(entry) {
     // Add date
     doc.setFontSize(14);
     doc.setTextColor(0, 0, 0);
-    const entryDate = new Date(entry.date);
+    const entryDate = parseEntryDate(entry.date);
     const dateText = entryDate.toLocaleDateString('en-US', {
         weekday: 'long',
         year: 'numeric',
@@ -1574,7 +1543,12 @@ async function downloadEntryAsPDF(entry) {
                 doc.text(`Video ${i + 1}: [Video file attached]`, margin, yPosition);
                 yPosition += 7;
             } else if (media.type === 'url') {
-                doc.textWithLink(`URL ${i + 1}: ${media.data}`, margin, yPosition, { url: media.data });
+                const safeUrl = sanitizeUrl(media.data);
+                if (safeUrl) {
+                    doc.textWithLink(`URL ${i + 1}: ${media.data}`, margin, yPosition, { url: safeUrl });
+                } else {
+                    doc.text(`URL ${i + 1}: ${media.data}`, margin, yPosition);
+                }
                 yPosition += 7;
             }
         }
@@ -1616,7 +1590,7 @@ async function downloadAllAsPDF() {
     doc.text(`Total entries: ${entries.length}`, pageWidth / 2, yPosition + 7, { align: 'center' });
 
     // Sort entries by date (oldest first for chronological reading)
-    const sortedEntries = [...entries].sort((a, b) => new Date(a.date) - new Date(b.date));
+    const sortedEntries = [...entries].sort((a, b) => a.date.localeCompare(b.date));
 
     for (let entryIndex = 0; entryIndex < sortedEntries.length; entryIndex++) {
         const entry = sortedEntries[entryIndex];
@@ -1627,7 +1601,7 @@ async function downloadAllAsPDF() {
         // Add entry date
         doc.setFontSize(16);
         doc.setTextColor(102, 126, 234);
-        const entryDate = new Date(entry.date);
+        const entryDate = parseEntryDate(entry.date);
         const dateText = entryDate.toLocaleDateString('en-US', {
             weekday: 'long',
             year: 'numeric',
@@ -1721,6 +1695,6 @@ async function downloadAllAsPDF() {
     }
 
     // Save the PDF
-    const filename = `journal_all_entries_${new Date().toISOString().split('T')[0]}.pdf`;
+    const filename = `journal_all_entries_${toLocalDateString()}.pdf`;
     doc.save(filename);
 }

@@ -1,0 +1,39 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isOwner(userId) {
+      return request.auth != null && request.auth.uid == userId;
+    }
+
+    // Shape check so a buggy or malicious client can't store arbitrary data
+    function hasValidFields(data) {
+      return data.date is string
+        && data.date.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+        && data.text is string
+        && data.text.size() <= 200000
+        && data.media is list
+        && data.media.size() <= 50
+        && (!('content' in data) || data.content is map)
+        && data.updatedAt is timestamp;
+    }
+
+    // Users can only access their own entries
+    match /users/{userId}/entries/{entryId} {
+      allow read, delete: if isOwner(userId);
+
+      allow create: if isOwner(userId)
+        && request.resource.data.keys().hasOnly(['date', 'text', 'content', 'media', 'createdAt', 'updatedAt'])
+        && hasValidFields(request.resource.data)
+        && request.resource.data.createdAt is timestamp;
+
+      // Only content fields may change; createdAt is set once
+      allow update: if isOwner(userId)
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['date', 'text', 'content', 'media', 'updatedAt'])
+        && hasValidFields(request.resource.data);
+    }
+
+    // Everything else is denied
+  }
+}

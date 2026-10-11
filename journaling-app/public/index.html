@@ -6,17 +6,20 @@
     <title>My Journal</title>
     <link rel="stylesheet" href="styles.css">
 
+    <meta name="referrer" content="no-referrer">
+
+    <!-- Third-party scripts are pinned with Subresource Integrity hashes so a compromised CDN can't inject code -->
     <!-- Firebase SDK -->
-    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-app-compat.js"></script>
-    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-auth-compat.js"></script>
-    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-firestore-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-app-compat.js" integrity="sha384-ViccRjS0k/lvYsrtaKXk+ES61/4PAZlFI/mPHmLC1YWzK0AIbXbI5ZXDzcm3F8gH" crossorigin="anonymous"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-auth-compat.js" integrity="sha384-+/4lqMnmLqwbdHXshvGDmBTeWlNoPRdjXi4ZsiBj10EhQXaTBe3RF5JZktdSjug6" crossorigin="anonymous"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-firestore-compat.js" integrity="sha384-7TetnPNdXXu6qURzIEXWCwpXedGGBJSXIR5Cv0gOWTB34UD5TxPHx33PhjA6wFQ3" crossorigin="anonymous"></script>
 
     <!-- jsPDF for PDF export -->
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/4.1.0/jspdf.umd.min.js" integrity="sha384-O8uvtxpjN7zEAkrRa8Jvgy+DAGE+15nh9uzvnf3pJ8GlntgJKrgouk/qrZpfXApg" crossorigin="anonymous"></script>
 
     <!-- Quill Editor -->
-    <link href="https://cdn.quilljs.com/1.3.7/quill.snow.css" rel="stylesheet">
-    <script src="https://cdn.quilljs.com/1.3.7/quill.js"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/quill/1.3.7/quill.snow.min.css" rel="stylesheet" integrity="sha384-Cr4NirNGPwhXoUPml2HA5PmMExeUuxM/oxUMDhMdSzUi9udHL+hdgDZZpq/2rOrp" crossorigin="anonymous">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/quill/1.3.7/quill.min.js" integrity="sha384-QUJ+ckWz1M+a7w0UfG1sEn4pPrbQwSxGm/1TIPyioqXBrwuT9l4f9gdHWLDLbVWI" crossorigin="anonymous"></script>
 
     <!-- Firebase Configuration -->
     <script src="firebase-config.js"></script>
@@ -44,7 +47,7 @@
                 <p>Create your account</p>
                 <form id="signup-form-element">
                     <input type="email" id="signup-email" placeholder="Email" required autocomplete="email">
-                    <input type="password" id="signup-password" placeholder="Password (min 6 characters)" required autocomplete="new-password">
+                    <input type="password" id="signup-password" placeholder="Password (min 8 characters)" required minlength="8" autocomplete="new-password">
                     <button type="submit">Create Account</button>
                 </form>
                 <p class="switch-mode">Already have an account? <a href="#" id="show-signin">Sign in</a></p>
@@ -203,7 +206,7 @@
                         <!-- Media Section -->
                         <div class="editor-media">
                             <h3>Add Media</h3>
-                            <p class="media-hint">Images are automatically compressed for optimal performance</p>
+                            <p class="media-hint">Images are automatically compressed. Each entry can hold about 900 KB of media, so keep videos very short or add them as a link.</p>
                             <div class="media-input">
                                 <label for="editor-image-upload">Image:</label>
                                 <input type="file" id="editor-image-upload" accept="image/*" multiple>
@@ -214,7 +217,7 @@
                             </div>
                             <div class="media-input">
                                 <label for="editor-url-input">URL:</label>
-                                <input type="text" id="editor-url-input" placeholder="https://example.com">
+                                <input type="url" id="editor-url-input" placeholder="https://example.com" maxlength="2048">
                                 <button id="editor-add-url-btn">Add URL</button>
                             </div>
                             <div id="editor-media-preview"></div>
