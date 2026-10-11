@@ -171,6 +171,7 @@ function showLogin() {
 async function showApp() {
     document.getElementById('login-container').style.display = 'none';
     document.getElementById('app-container').style.display = 'block';
+    document.getElementById('user-email').textContent = currentUser.email || '';
 
     // Check for localStorage migration
     await checkForMigration();

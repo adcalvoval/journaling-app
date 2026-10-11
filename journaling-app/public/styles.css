@@ -854,6 +854,28 @@ header h1 {
     background: var(--bg-selected);
 }
 
+.header-account {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    min-width: 0;
+}
+
+.user-email {
+    font-size: 0.85em;
+    color: var(--text-secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 220px;
+}
+
+@media (max-width: 600px) {
+    .user-email {
+        display: none;
+    }
+}
+
 h2 {
     color: var(--text-primary);
     margin-bottom: 24px;
@@ -1407,30 +1429,6 @@ h3 {
     font-size: 0.9em;
     font-weight: 500;
     min-height: 20px;
-}
-
-/* Logout Button */
-.logout-btn {
-    position: absolute;
-    top: 48px;
-    right: 40px;
-    padding: 10px 20px;
-    background: rgba(255, 255, 255, 0.15);
-    color: white;
-    border: 1.5px solid rgba(255, 255, 255, 0.5);
-    border-radius: var(--radius-sm);
-    cursor: pointer;
-    font-size: 0.85em;
-    font-weight: 600;
-    transition: all 0.2s ease;
-    backdrop-filter: blur(10px);
-}
-
-.logout-btn:hover {
-    background: white;
-    color: var(--primary);
-    border-color: white;
-    transform: translateY(-1px);
 }
 
 /* Download Buttons */
