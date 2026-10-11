@@ -92,6 +92,25 @@ function confirmDiscardChanges() {
     return true;
 }
 
+// On narrow screens the sidebar (calendar + entry list) is an overlay toggled from the header
+function isNarrowScreen() {
+    return window.matchMedia('(max-width: 768px)').matches;
+}
+
+function setSidebarOpen(open) {
+    const sidebar = document.querySelector('.sidebar');
+    const toggle = document.getElementById('sidebar-toggle');
+    if (!sidebar || !toggle) return;
+
+    if (open) {
+        // Sit just below the header, whatever its height
+        sidebar.style.top = document.querySelector('header').offsetHeight + 'px';
+    }
+    sidebar.classList.toggle('mobile-show', open);
+    toggle.setAttribute('aria-expanded', String(open));
+    toggle.textContent = open ? '✕ Close' : '☰ Calendar';
+}
+
 function showLoginMessage(message, isSuccess = false) {
     const el = document.getElementById('login-error');
     el.textContent = message;
@@ -802,6 +821,9 @@ function selectEntry(entryId, { skipConfirm = false } = {}) {
     displayEntryList();
 
     // Show entry detail
+    // Get the overlay out of the way so the entry is visible on small screens
+    setSidebarOpen(false);
+
     const entry = entries.find(e => e.id === entryId);
     if (!entry) return;
 
@@ -881,6 +903,8 @@ function displayEntryDetail(entry) {
 // Show editor for new entry
 function showNewEntryEditor() {
     if (!confirmDiscardChanges()) return;
+
+    setSidebarOpen(false);
 
     selectedEntryId = null;
     currentViewMode = 'new';
@@ -1036,6 +1060,9 @@ function showEmptyState() {
     document.getElementById('empty-state').style.display = 'flex';
     document.getElementById('entry-detail').style.display = 'none';
     document.getElementById('entry-editor').style.display = 'none';
+
+    // Nothing to show in the main pane, so on small screens show the calendar and list instead
+    if (isNarrowScreen()) setSidebarOpen(true);
 }
 
 function initApp() {
@@ -1102,6 +1129,11 @@ function initApp() {
 
     const lightboxNext = document.querySelector('.lightbox-next');
     if (lightboxNext) lightboxNext.addEventListener('click', () => navigateLightbox(1));
+
+    document.getElementById('sidebar-toggle').addEventListener('click', () => {
+        const isOpen = document.querySelector('.sidebar').classList.contains('mobile-show');
+        setSidebarOpen(!isOpen);
+    });
 
     const editorDate = document.getElementById('editor-date');
     if (editorDate) editorDate.addEventListener('change', () => { editorDirty = true; });

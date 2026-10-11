@@ -854,6 +854,24 @@ header h1 {
     background: var(--bg-selected);
 }
 
+/* Only shown on narrow screens, where the sidebar is hidden */
+.sidebar-toggle {
+    display: none;
+    align-items: center;
+    background: transparent;
+    color: var(--accent-blue);
+    border: 1px solid var(--accent-blue);
+    padding: 6px 12px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-weight: 600;
+    font-size: 0.85em;
+}
+
+.sidebar-toggle[aria-expanded="true"] {
+    background: var(--bg-selected);
+}
+
 .header-account {
     display: flex;
     align-items: center;
@@ -1700,12 +1718,26 @@ h3 {
     .sidebar.mobile-show {
         display: flex;
         position: fixed;
-        top: 70px;
+        top: 58px;
         left: 0;
         right: 0;
         bottom: 0;
         z-index: 100;
         background: var(--bg-sidebar);
+        overflow-y: auto;
+    }
+
+    .sidebar.mobile-show .sidebar-entries {
+        flex: none;
+        overflow: visible;
+    }
+
+    .sidebar-toggle {
+        display: inline-flex;
+    }
+
+    #current-date {
+        display: none;
     }
 
     .main-pane {
