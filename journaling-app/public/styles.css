@@ -1702,7 +1702,7 @@ h3 {
 }
 
 /* Responsive Design */
-@media (max-width: 768px) {
+@media (max-width: 600px) {
     body {
         padding: 0;
     }
@@ -1867,4 +1867,15 @@ h3 {
 
 .login-error.success {
     color: var(--success, #2e7d32);
+}
+
+/* Smaller laptop windows (e.g. snapped to half the screen): keep the sidebar, just narrower */
+@media (min-width: 601px) and (max-width: 1024px) {
+    .app-layout {
+        grid-template-columns: 280px 1fr;
+    }
+
+    .sidebar-calendar {
+        padding: 12px 8px;
+    }
 }

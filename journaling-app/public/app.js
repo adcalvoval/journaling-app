@@ -94,7 +94,7 @@ function confirmDiscardChanges() {
 
 // On narrow screens the sidebar (calendar + entry list) is an overlay toggled from the header
 function isNarrowScreen() {
-    return window.matchMedia('(max-width: 768px)').matches;
+    return window.matchMedia('(max-width: 600px)').matches;
 }
 
 function setSidebarOpen(open) {
